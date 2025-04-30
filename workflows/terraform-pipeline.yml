@@ -1,0 +1,162 @@
+name: Terraform CI/CD Pipeline
+
+# Features:
+# - Build, Test, Deploy stages
+# - SonarQube for code quality
+# - Snyk for security scans
+# - Centralized secrets management (GitHub Secrets)
+# - Approval gates (GitHub Environments)
+# - Slack notifications
+# - Parallel jobs
+# - Blue-green deployment strategy
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**/*.tf'
+      - 'modules/**/*'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - '**/*.tf'
+      - 'modules/**/*'
+      - '.github/workflows/**'
+
+# Define environment variables
+env:
+  TERRAFORM_VERSION: '1.5.7'
+  AWS_REGION: 'us-west-2'
+  TERRAFORM_STATE_BUCKET: '${{ github.repository }}-terraform-state'
+  TERRAFORM_STATE_KEY: '${{ github.repository }}/${{ github.ref_name }}'
+
+# Define jobs
+jobs:
+  ##############################################
+  # VALIDATE STAGE
+  ##############################################
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v3
+        with:
+          tflint_version: v0.44.1
+
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --format=junit --recursive > tflint-result.xml || true
+
+      - name: Upload TFLint Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: tflint-results
+          path: tflint-result.xml
+          
+  tfsec:
+    name: TFSec Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run TFSec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          format: junit
+          out: tfsec-result.xml
+
+      - name: Upload TFSec Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfsec-results
+          path: tfsec-result.xml
+
+  checkov:
+    name: Checkov Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: junitxml
+          output_file_path: checkov-result.xml
+          soft_fail: true
+
+      - name: Upload Checkov Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: checkov-results
+          path: checkov-result.xml
+
+  ##############################################
+  # CODE QUALITY STAGE
+  ##############################################
+  sonarqube:
+    name: SonarQube Analysis
+    needs: [validate, tflint, tfsec, checkov]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository }}
+            -Dsonar.projectName=${{ github.repository }}
+            -Dsonar.exclusions=**/*.md,**/*.png,**/*.jpg
+            -Dsonar.terraform.file.suffixes=.tf
+            -Dsonar.terraform.activate=true
+
+  snyk:
+    name: Snyk Security Scan
+    needs: [validate, tflint, tfsec, checkov]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Snyk
+        uses: snyk/actions/iac@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high

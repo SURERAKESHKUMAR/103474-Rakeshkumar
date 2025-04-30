@@ -1,0 +1,402 @@
+name: Terraform Deployment Pipeline
+
+# Features:
+# - Build, Test, Deploy stages
+# - Centralized secrets management (GitHub Secrets)
+# - Approval gates (GitHub Environments)
+# - Slack notifications
+# - Parallel jobs
+# - Blue-green deployment strategy
+
+on:
+  workflow_run:
+    workflows: ["Terraform CI/CD Pipeline"]
+    types:
+      - completed
+    branches: [main, master]
+
+# Define environment variables
+env:
+  TERRAFORM_VERSION: '1.5.7'
+  AWS_REGION: 'us-west-2'
+  TERRAFORM_STATE_BUCKET: '${{ github.repository }}-terraform-state'
+  TERRAFORM_STATE_KEY: '${{ github.repository }}/${{ github.ref_name }}'
+
+# Define jobs
+jobs:
+  ##############################################
+  # PLAN STAGE
+  ##############################################
+  plan_dev:
+    name: Plan Dev
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/dev" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Create Dev Config
+        run: |
+          cat > dev.tfvars << EOF
+          environment = "dev"
+          min_capacity = 2
+          max_capacity = 10
+          enable_enhanced_monitoring = false
+          EOF
+
+      - name: Terraform Plan
+        run: terraform plan -var-file=dev.tfvars -out=dev.tfplan
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-dev
+          path: dev.tfplan
+
+  plan_staging:
+    name: Plan Staging
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/staging" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Create Staging Config
+        run: |
+          cat > staging.tfvars << EOF
+          environment = "staging"
+          min_capacity = 2
+          max_capacity = 10
+          enable_enhanced_monitoring = true
+          EOF
+
+      - name: Terraform Plan
+        run: terraform plan -var-file=staging.tfvars -out=staging.tfplan
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-staging
+          path: staging.tfplan
+
+  plan_prod:
+    name: Plan Production
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/prod" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Create Production Config
+        run: |
+          cat > prod.tfvars << EOF
+          environment = "prod"
+          min_capacity = 4
+          max_capacity = 20
+          enable_enhanced_monitoring = true
+          EOF
+
+      - name: Terraform Plan
+        run: terraform plan -var-file=prod.tfvars -out=prod.tfplan
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-prod
+          path: prod.tfplan
+
+  ##############################################
+  # DEPLOY STAGES
+  ##############################################
+  deploy_dev:
+    name: Deploy to Dev
+    needs: [plan_dev]
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-dev
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/dev" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve dev.tfplan
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "Deployment to Dev completed successfully!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Deployment Status: Success*\n*Environment:* Dev\n*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy_staging:
+    name: Deploy to Staging
+    needs: [deploy_dev]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-staging
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/staging" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve staging.tfplan
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "Deployment to Staging completed successfully!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Deployment Status: Success*\n*Environment:* Staging\n*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy_prod:
+    name: Deploy to Production
+    needs: [deploy_staging]
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: ${{ steps.get_url.outputs.app_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-prod
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TERRAFORM_STATE_KEY }}/prod" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      # Blue-Green Deployment for Production
+      - name: Prepare Blue-Green Deployment
+        run: |
+          # Create a deployment ID
+          DEPLOYMENT_ID=$(date +%Y%m%d%H%M%S)
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_ENV
+          
+          # Create blue-green config
+          cat > blue-green.tfvars << EOF
+          # Blue-green deployment configuration
+          ecs_service_name = "$DEPLOYMENT_ID-prod-service"
+          EOF
+          
+          # Merge with prod config
+          cat blue-green.tfvars >> prod.tfvars
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve prod.tfplan
+
+      - name: Validate New Deployment
+        run: |
+          # Extract the ALB DNS name
+          ALB_DNS=$(terraform output -json | jq -r '.alb_dns_name.value')
+          
+          # Wait for the new service to be healthy
+          echo "Waiting for new service to be healthy..."
+          for i in {1..30}; do
+            STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/health || echo "000")
+            if [ "$STATUS_CODE" == "200" ]; then
+              echo "Service is healthy!"
+              break
+            fi
+            echo "Service not healthy yet, status code: $STATUS_CODE. Retrying in 10 seconds..."
+            sleep 10
+          done
+          
+          if [ "$STATUS_CODE" != "200" ]; then
+            echo "New service is not healthy after 5 minutes. Deployment failed."
+            exit 1
+          fi
+          
+          # Set the application URL for the environment
+          echo "app_url=http://$ALB_DNS" >> $GITHUB_OUTPUT
+        id: get_url
+
+      - name: Switch Traffic to New Version
+        run: |
+          # Get the current and new target group ARNs
+          OLD_TG_ARN=$(aws elbv2 describe-target-groups --names "prod-blue-tg" --query 'TargetGroups[0].TargetGroupArn' --output text || echo "")
+          NEW_TG_ARN=$(aws elbv2 describe-target-groups --names "prod-green-tg" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          
+          # Get the listener ARN
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $(terraform output -json | jq -r '.alb_arn.value') --query 'Listeners[0].ListenerArn' --output text)
+          
+          # Modify the listener to use the new target group
+          aws elbv2 modify-listener --listener-arn $LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$NEW_TG_ARN
+          
+          echo "Traffic switched to new version successfully!"
+
+      - name: Terminate Old Version
+        run: |
+          # Get the old ECS service name
+          OLD_SERVICE=$(aws ecs list-services --cluster prod-cluster --query 'serviceArns[0]' --output text | awk -F'/' '{print $3}' || echo "")
+          
+          if [ ! -z "$OLD_SERVICE" ] && [ "$OLD_SERVICE" != "null" ]; then
+            # Update the old service to 0 tasks
+            aws ecs update-service --cluster prod-cluster --service $OLD_SERVICE --desired-count 0
+            echo "Old version scaled down to 0 tasks."
+          else
+            echo "No old service found to terminate."
+          fi
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "Deployment to Production completed successfully!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Deployment Status: Success*\n*Environment:* Production\n*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*URL:* ${{ steps.get_url.outputs.app_url }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
