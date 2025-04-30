@@ -1,0 +1,263 @@
+# Terraform Apply Steps Template
+# This template contains the steps for running terraform apply with blue-green deployment option
+
+parameters:
+  - name: environment
+    type: string
+    default: 'dev'
+  - name: workingDirectory
+    type: string
+    default: '$(System.DefaultWorkingDirectory)'
+  - name: backendServiceArm
+    type: string
+  - name: backendAWSBucketName
+    type: string
+  - name: backendAWSKey
+    type: string
+  - name: environmentServiceNameAWS
+    type: string
+  - name: autoApply
+    type: boolean
+    default: false
+  - name: blueGreenDeployment
+    type: boolean
+    default: false
+
+steps:
+  - task: TerraformInstaller@0
+    displayName: 'Install Terraform'
+    inputs:
+      terraformVersion: '1.5.7'
+
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download Terraform Plan'
+    inputs:
+      artifact: 'terraform-plan-${{ parameters.environment }}'
+      path: '${{ parameters.workingDirectory }}'
+
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Init'
+    inputs:
+      provider: 'aws'
+      command: 'init'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      backendServiceAWS: '${{ parameters.backendServiceArm }}'
+      backendAWSBucketName: '${{ parameters.backendAWSBucketName }}'
+      backendAWSKey: '${{ parameters.backendAWSKey }}'
+
+  # Retrieve secrets from AWS Secrets Manager
+  - task: AWSShellScript@1
+    displayName: 'Retrieve Secrets from AWS Secrets Manager'
+    inputs:
+      awsCredentials: '${{ parameters.environmentServiceNameAWS }}'
+      regionName: '$(TERRAFORM_STATE_REGION)'
+      scriptType: 'inline'
+      inlineScript: |
+        # Retrieve secrets and export as environment variables
+        SECRETS=$(aws secretsmanager get-secret-value --secret-id terraform-${{ parameters.environment }}-secrets --query SecretString --output text)
+        
+        # Parse JSON and export as environment variables
+        echo "$SECRETS" | jq -r 'to_entries | .[] | "echo \"##vso[task.setvariable variable=" + .key + "]" + .value + "\"" | "export " + .key + "=" + .value' | bash
+        
+        # Create tfvars file from secrets
+        echo "$SECRETS" | jq -r 'to_entries | .[] | .key + " = \"" + .value + "\""' > ${{ parameters.workingDirectory }}/secrets.auto.tfvars
+
+  # Create environment-specific tfvars file
+  - task: Bash@3
+    displayName: 'Create Environment Config'
+    inputs:
+      targetType: 'inline'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        cat > ${{ parameters.environment }}.tfvars << EOF
+        environment = "${{ parameters.environment }}"
+        
+        # Add environment-specific variable overrides here
+        # For example:
+        min_capacity = ${{ if eq(parameters.environment, 'prod') }}4${{ else }}2${{ end }}
+        max_capacity = ${{ if eq(parameters.environment, 'prod') }}20${{ else }}10${{ end }}
+        enable_enhanced_monitoring = ${{ if eq(parameters.environment, 'prod') }}true${{ else if eq(parameters.environment, 'staging') }}true${{ else }}false${{ end }}
+        EOF
+
+  # If blue-green deployment is enabled, prepare for it
+  - ${{ if eq(parameters.blueGreenDeployment, true) }}:
+    - task: Bash@3
+      displayName: 'Prepare Blue-Green Deployment'
+      inputs:
+        targetType: 'inline'
+        workingDirectory: '${{ parameters.workingDirectory }}'
+        script: |
+          # Create a blue-green deployment configuration
+          cat > blue-green-config.tfvars << EOF
+          # Blue-Green deployment configuration
+          ecs_service_name = "$(date +%Y%m%d%H%M%S)-${{ parameters.environment }}-service"
+          EOF
+          
+          # Merge with environment config
+          cat blue-green-config.tfvars >> ${{ parameters.environment }}.tfvars
+
+  # Apply the Terraform plan
+  - ${{ if eq(parameters.autoApply, true) }}:
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'aws'
+        command: 'apply'
+        workingDirectory: '${{ parameters.workingDirectory }}'
+        environmentServiceNameAWS: '${{ parameters.environmentServiceNameAWS }}'
+        commandOptions: '${{ parameters.environment }}.tfplan'
+
+  - ${{ if eq(parameters.autoApply, false) }}:
+    - task: ManualValidation@0
+      displayName: 'Manual Approval'
+      timeoutInMinutes: 1440 # 24 hours
+      inputs:
+        notifyUsers: '$(APPROVAL_NOTIFICATION_EMAIL)'
+        instructions: 'Please review the Terraform plan for ${{ parameters.environment }} and approve the deployment.'
+        onTimeout: 'reject'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'aws'
+        command: 'apply'
+        workingDirectory: '${{ parameters.workingDirectory }}'
+        environmentServiceNameAWS: '${{ parameters.environmentServiceNameAWS }}'
+        commandOptions: '${{ parameters.environment }}.tfplan'
+
+  # If blue-green deployment, perform the traffic switch
+  - ${{ if eq(parameters.blueGreenDeployment, true) }}:
+    - task: Bash@3
+      displayName: 'Validate New Deployment'
+      inputs:
+        targetType: 'inline'
+        workingDirectory: '${{ parameters.workingDirectory }}'
+        script: |
+          # Extract the ALB DNS name from Terraform outputs
+          ALB_DNS=$(terraform output -json | jq -r '.alb_dns_name.value')
+          
+          # Wait for the new service to be healthy
+          echo "Waiting for new service to be healthy..."
+          for i in {1..30}; do
+            STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/health)
+            if [ "$STATUS_CODE" == "200" ]; then
+              echo "Service is healthy!"
+              break
+            fi
+            echo "Service not healthy yet, status code: $STATUS_CODE. Retrying in 10 seconds..."
+            sleep 10
+          done
+          
+          if [ "$STATUS_CODE" != "200" ]; then
+            echo "##vso[task.logissue type=error]New service is not healthy after 5 minutes. Deployment failed."
+            exit 1
+          fi
+
+    - task: ManualValidation@0
+      displayName: 'Approve Traffic Switch'
+      timeoutInMinutes: 1440 # 24 hours
+      inputs:
+        notifyUsers: '$(APPROVAL_NOTIFICATION_EMAIL)'
+        instructions: 'The new version has been deployed. Please verify the new version and approve to switch traffic.'
+        onTimeout: 'reject'
+
+    - task: AWSShellScript@1
+      displayName: 'Switch Traffic to New Version'
+      inputs:
+        awsCredentials: '${{ parameters.environmentServiceNameAWS }}'
+        regionName: '$(TERRAFORM_STATE_REGION)'
+        scriptType: 'inline'
+        inlineScript: |
+          # Get the current and new target group ARNs
+          OLD_TG_ARN=$(aws elbv2 describe-target-groups --names "${{ parameters.environment }}-blue-tg" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          NEW_TG_ARN=$(aws elbv2 describe-target-groups --names "${{ parameters.environment }}-green-tg" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          
+          # Get the listener ARN
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $(terraform output -json | jq -r '.alb_arn.value') --query 'Listeners[0].ListenerArn' --output text)
+          
+          # Modify the listener to use the new target group
+          aws elbv2 modify-listener --listener-arn $LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$NEW_TG_ARN
+          
+          echo "Traffic switched to new version successfully!"
+
+    - task: ManualValidation@0
+      displayName: 'Approve Old Version Termination'
+      timeoutInMinutes: 1440 # 24 hours
+      inputs:
+        notifyUsers: '$(APPROVAL_NOTIFICATION_EMAIL)'
+        instructions: 'Traffic has been switched to the new version. Please approve to terminate the old version.'
+        onTimeout: 'reject'
+
+    - task: AWSShellScript@1
+      displayName: 'Terminate Old Version'
+      inputs:
+        awsCredentials: '${{ parameters.environmentServiceNameAWS }}'
+        regionName: '$(TERRAFORM_STATE_REGION)'
+        scriptType: 'inline'
+        inlineScript: |
+          # Get the old ECS service name
+          OLD_SERVICE=$(aws ecs list-services --cluster ${{ parameters.environment }}-cluster --query 'serviceArns[0]' --output text | awk -F'/' '{print $3}')
+          
+          # Update the old service to 0 tasks
+          aws ecs update-service --cluster ${{ parameters.environment }}-cluster --service $OLD_SERVICE --desired-count 0
+          
+          echo "Old version scaled down to 0 tasks."
+
+  # Output the deployment results
+  - task: Bash@3
+    displayName: 'Output Deployment Results'
+    inputs:
+      targetType: 'inline'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        # Extract and display important outputs
+        echo "## Deployment Results for ${{ parameters.environment }}"
+        echo ""
+        echo "### Infrastructure Outputs"
+        terraform output
+        
+        # If we have an ALB DNS name, display it
+        ALB_DNS=$(terraform output -json | jq -r '.alb_dns_name.value // empty')
+        if [ ! -z "$ALB_DNS" ]; then
+          echo ""
+          echo "### Access Information"
+          echo "Application URL: http://$ALB_DNS"
+        fi
+        
+        # Set output variables for use in subsequent tasks
+        echo "##vso[task.setvariable variable=deploymentUrl;isOutput=true]http://$ALB_DNS"
+
+  # Send deployment notification
+  - task: Bash@3
+    displayName: 'Send Deployment Notification'
+    inputs:
+      targetType: 'inline'
+      script: |
+        # Get the deployment URL
+        DEPLOYMENT_URL=$(terraform output -json | jq -r '.alb_dns_name.value // empty')
+        if [ ! -z "$DEPLOYMENT_URL" ]; then
+          DEPLOYMENT_URL="http://$DEPLOYMENT_URL"
+        else
+          DEPLOYMENT_URL="N/A"
+        fi
+        
+        # Send notification to Slack
+        curl -X POST -H 'Content-type: application/json' --data '{
+          "channel": "$(SLACK_CHANNEL)",
+          "attachments": [
+            {
+              "color": "good",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Terraform Deployment Completed*\n*Environment:* ${{ parameters.environment }}\n*URL:* '"$DEPLOYMENT_URL"'\n*Pipeline:* <$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|$(Build.BuildNumber)>"
+                  }
+                }
+              ]
+            }
+          ]
+        }' $(SLACK_WEBHOOK_URL)
+    env:
+      SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)

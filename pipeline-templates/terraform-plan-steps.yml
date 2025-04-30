@@ -1,0 +1,132 @@
+# Terraform Plan Steps Template
+# This template contains the steps for running terraform plan
+
+parameters:
+  - name: environment
+    type: string
+    default: 'dev'
+  - name: workingDirectory
+    type: string
+    default: '$(System.DefaultWorkingDirectory)'
+  - name: backendServiceArm
+    type: string
+  - name: backendAWSBucketName
+    type: string
+  - name: backendAWSKey
+    type: string
+  - name: environmentServiceNameAWS
+    type: string
+
+steps:
+  - task: TerraformInstaller@0
+    displayName: 'Install Terraform'
+    inputs:
+      terraformVersion: '1.5.7'
+
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Init'
+    inputs:
+      provider: 'aws'
+      command: 'init'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      backendServiceAWS: '${{ parameters.backendServiceArm }}'
+      backendAWSBucketName: '${{ parameters.backendAWSBucketName }}'
+      backendAWSKey: '${{ parameters.backendAWSKey }}'
+
+  # Retrieve secrets from AWS Secrets Manager
+  - task: AWSShellScript@1
+    displayName: 'Retrieve Secrets from AWS Secrets Manager'
+    inputs:
+      awsCredentials: '${{ parameters.environmentServiceNameAWS }}'
+      regionName: '$(TERRAFORM_STATE_REGION)'
+      scriptType: 'inline'
+      inlineScript: |
+        # Retrieve secrets and export as environment variables
+        SECRETS=$(aws secretsmanager get-secret-value --secret-id terraform-${{ parameters.environment }}-secrets --query SecretString --output text)
+        
+        # Parse JSON and export as environment variables
+        echo "$SECRETS" | jq -r 'to_entries | .[] | "echo \"##vso[task.setvariable variable=" + .key + "]" + .value + "\"" | "export " + .key + "=" + .value' | bash
+        
+        # Create tfvars file from secrets
+        echo "$SECRETS" | jq -r 'to_entries | .[] | .key + " = \"" + .value + "\""' > ${{ parameters.workingDirectory }}/secrets.auto.tfvars
+
+  # Create environment-specific tfvars file
+  - task: Bash@3
+    displayName: 'Create Environment Config'
+    inputs:
+      targetType: 'inline'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        cat > ${{ parameters.environment }}.tfvars << EOF
+        environment = "${{ parameters.environment }}"
+        
+        # Add environment-specific variable overrides here
+        # For example:
+        min_capacity = ${{ if eq(parameters.environment, 'prod') }}4${{ else }}2${{ end }}
+        max_capacity = ${{ if eq(parameters.environment, 'prod') }}20${{ else }}10${{ end }}
+        enable_enhanced_monitoring = ${{ if eq(parameters.environment, 'prod') }}true${{ else if eq(parameters.environment, 'staging') }}true${{ else }}false${{ end }}
+        EOF
+
+  # Run terraform plan
+  - task: TerraformTaskV4@4
+    displayName: 'Terraform Plan'
+    inputs:
+      provider: 'aws'
+      command: 'plan'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      environmentServiceNameAWS: '${{ parameters.environmentServiceNameAWS }}'
+      commandOptions: '-var-file="${{ parameters.environment }}.tfvars" -out="${{ parameters.environment }}.tfplan"'
+
+  # Publish the plan as an artifact
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Terraform Plan'
+    inputs:
+      targetPath: '${{ parameters.workingDirectory }}/${{ parameters.environment }}.tfplan'
+      artifact: 'terraform-plan-${{ parameters.environment }}'
+      publishLocation: 'pipeline'
+
+  # Generate and publish plan summary
+  - task: Bash@3
+    displayName: 'Generate Plan Summary'
+    inputs:
+      targetType: 'inline'
+      workingDirectory: '${{ parameters.workingDirectory }}'
+      script: |
+        # Create a summary of the plan
+        terraform show -no-color "${{ parameters.environment }}.tfplan" > "${{ parameters.environment }}-plan-summary.txt"
+        
+        # Extract the changes summary
+        echo "## Terraform Plan Summary for ${{ parameters.environment }}" > "${{ parameters.environment }}-plan-changes.md"
+        echo "" >> "${{ parameters.environment }}-plan-changes.md"
+        echo '```' >> "${{ parameters.environment }}-plan-changes.md"
+        terraform show -no-color "${{ parameters.environment }}.tfplan" | grep -A 2 "Plan:" >> "${{ parameters.environment }}-plan-changes.md"
+        echo '```' >> "${{ parameters.environment }}-plan-changes.md"
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish Plan Summary'
+    inputs:
+      targetPath: '${{ parameters.workingDirectory }}/${{ parameters.environment }}-plan-summary.txt'
+      artifact: 'terraform-plan-summary-${{ parameters.environment }}'
+      publishLocation: 'pipeline'
+
+  # Post the plan summary to the PR if this is a PR build
+  - task: Bash@3
+    displayName: 'Post Plan Summary to PR'
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    inputs:
+      targetType: 'inline'
+      script: |
+        PLAN_SUMMARY=$(cat "${{ parameters.workingDirectory }}/${{ parameters.environment }}-plan-changes.md")
+        
+        # Post comment to PR
+        COMMENT_URL="$(System.PullRequest.SourceRepositoryUri)/$(System.PullRequest.PullRequestId)/comments"
+        AUTH_HEADER="Authorization: Bearer $(System.AccessToken)"
+        CONTENT_HEADER="Content-Type: application/json"
+        
+        # Create JSON payload
+        PAYLOAD=$(echo '{"comments": [{"parentCommentId": 0, "content": "'"${PLAN_SUMMARY}"'", "commentType": 1}]}' | jq -c .)
+        
+        # Post comment
+        curl -X POST -H "${AUTH_HEADER}" -H "${CONTENT_HEADER}" -d "${PAYLOAD}" "${COMMENT_URL}"
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)

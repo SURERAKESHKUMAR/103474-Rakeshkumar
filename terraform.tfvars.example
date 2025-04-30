@@ -1,0 +1,49 @@
+# General configuration
+aws_region  = "us-west-2"
+environment = "dev"
+project     = "ecs-app"
+
+default_tags = {
+  Environment = "dev"
+  Project     = "ecs-app"
+  ManagedBy   = "terraform"
+  Owner       = "your-team"
+  CostCenter  = "your-cost-center"
+}
+
+# Networking configuration
+vpc_cidr             = "10.0.0.0/16"
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+private_subnet_cidrs = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
+availability_zones   = ["us-west-2a", "us-west-2b", "us-west-2c"]
+
+# ECS configuration
+ecs_cluster_name = "app-cluster"
+ecs_service_name = "app-service"
+container_name   = "app"
+container_image  = "nginx:latest"  # Replace with your container image
+container_port   = 80
+container_cpu    = 256
+container_memory = 512
+desired_count    = 2
+
+# Auto scaling configuration
+enable_autoscaling = true
+min_capacity       = 2
+max_capacity       = 10
+cpu_target_value   = 70
+memory_target_value = 80
+
+# Load balancer configuration
+health_check_path = "/"
+health_check_interval = 30
+health_check_timeout = 5
+health_check_healthy_threshold = 3
+health_check_unhealthy_threshold = 3
+
+# Security configuration
+allowed_cidr_blocks = ["0.0.0.0/0"]  # Restrict this in production
+
+# Monitoring configuration
+enable_enhanced_monitoring = true
+alarm_email = "your-email@example.com"  # Replace with your email

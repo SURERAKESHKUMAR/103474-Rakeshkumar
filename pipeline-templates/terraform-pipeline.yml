@@ -1,0 +1,447 @@
+# Terraform CI/CD Pipeline Template
+# Features:
+# - Build, Test, Deploy stages
+# - SonarQube for code quality
+# - Snyk for security scans
+# - Centralized secrets management
+# - Approval gates
+# - Slack notifications
+# - Parallel jobs
+# - Blue-green deployment strategy
+
+# Pipeline parameters
+parameters:
+  - name: environments
+    type: object
+    default:
+      - name: dev
+        requireApproval: false
+        autoApply: true
+      - name: staging
+        requireApproval: true
+        autoApply: true
+      - name: prod
+        requireApproval: true
+        autoApply: false
+  - name: terraformVersion
+    type: string
+    default: '1.5.7'
+  - name: awsRegion
+    type: string
+    default: 'us-west-2'
+  - name: slackChannel
+    type: string
+    default: '#terraform-deployments'
+  - name: sonarQubeProjectKey
+    type: string
+    default: 'terraform-ecs-infrastructure'
+  - name: enableParallelJobs
+    type: boolean
+    default: true
+
+# Variables that should be set in the pipeline UI or variable groups
+variables:
+  - group: terraform-secrets # Contains AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+  - group: sonarqube-config # Contains SONAR_TOKEN
+  - group: snyk-config # Contains SNYK_TOKEN
+  - group: slack-webhook # Contains SLACK_WEBHOOK_URL
+  - name: TERRAFORM_STATE_BUCKET
+    value: '$(project)-terraform-state'
+  - name: TERRAFORM_STATE_KEY
+    value: '$(Build.Repository.Name)/$(Build.SourceBranchName)'
+  - name: TERRAFORM_STATE_REGION
+    value: '${{ parameters.awsRegion }}'
+
+# Trigger on main branch and pull requests
+trigger:
+  branches:
+    include:
+      - main
+      - master
+  paths:
+    include:
+      - '**/*.tf'
+      - 'modules/**/*'
+      - 'pipeline-templates/**/*'
+
+pr:
+  branches:
+    include:
+      - main
+      - master
+  paths:
+    include:
+      - '**/*.tf'
+      - 'modules/**/*'
+      - 'pipeline-templates/**/*'
+
+# Define stages
+stages:
+  ##############################################
+  # VALIDATE STAGE
+  ##############################################
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: TerraformValidate
+        displayName: 'Terraform Validate'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+              addToPath: true
+            displayName: 'Install Python'
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '${{ parameters.terraformVersion }}'
+            displayName: 'Install Terraform'
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Make validation scripts executable
+                chmod +x $(System.DefaultWorkingDirectory)/scripts/*.sh
+                
+                # Run custom Terraform validation script
+                $(System.DefaultWorkingDirectory)/scripts/validate-terraform.sh $(System.DefaultWorkingDirectory)
+              failOnStderr: false
+            displayName: 'Run Custom Terraform Validation'
+
+      - job: YAMLValidate
+        displayName: 'YAML Validate'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+              addToPath: true
+            displayName: 'Install Python'
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Install yamllint
+                pip install yamllint
+                
+                # Make validation scripts executable
+                chmod +x $(System.DefaultWorkingDirectory)/scripts/*.sh
+                
+                # Run custom YAML validation script
+                $(System.DefaultWorkingDirectory)/scripts/validate-yaml.sh $(System.DefaultWorkingDirectory)
+              failOnStderr: false
+            displayName: 'Run Custom YAML Validation'
+            
+      - job: TFLint
+        displayName: 'TFLint'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+                tflint --init
+                tflint --format=junit --recursive > tflint-result.xml || true
+              failOnStderr: false
+            displayName: 'Run TFLint'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/tflint-result.xml'
+              testRunTitle: 'TFLint Results'
+            displayName: 'Publish TFLint Results'
+
+      - job: TFSec
+        displayName: 'TFSec Security Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+                tfsec . --format=junit > tfsec-result.xml || true
+              failOnStderr: false
+            displayName: 'Run TFSec'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/tfsec-result.xml'
+              testRunTitle: 'TFSec Results'
+            displayName: 'Publish TFSec Results'
+
+      - job: Checkov
+        displayName: 'Checkov Security Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+              addToPath: true
+            displayName: 'Install Python'
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                pip install checkov
+                checkov -d . --output junitxml > checkov-result.xml || true
+              failOnStderr: false
+            displayName: 'Run Checkov'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/checkov-result.xml'
+              testRunTitle: 'Checkov Results'
+            displayName: 'Publish Checkov Results'
+
+  ##############################################
+  # DOCUMENTATION STAGE
+  ##############################################
+  - stage: Documentation
+    displayName: 'Generate Documentation'
+    dependsOn: Validate
+    condition: succeeded('Validate')
+    jobs:
+      - job: GenerateDocs
+        displayName: 'Generate Documentation'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.9'
+              addToPath: true
+            displayName: 'Install Python'
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '${{ parameters.terraformVersion }}'
+            displayName: 'Install Terraform'
+
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Install terraform-docs if available
+                curl -sSLo ./terraform-docs.tar.gz https://terraform-docs.io/dl/v0.16.0/terraform-docs-v0.16.0-$(uname)-amd64.tar.gz
+                tar -xzf terraform-docs.tar.gz
+                chmod +x terraform-docs
+                mv terraform-docs /usr/local/bin/terraform-docs || echo "Could not install terraform-docs, will use basic documentation"
+                
+                # Make scripts executable
+                chmod +x $(System.DefaultWorkingDirectory)/scripts/*.sh
+                
+                # Run documentation generation script
+                $(System.DefaultWorkingDirectory)/scripts/generate-docs.sh $(System.DefaultWorkingDirectory)
+              failOnStderr: false
+            displayName: 'Generate Documentation'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/docs'
+              artifact: 'terraform-documentation'
+              publishLocation: 'pipeline'
+            displayName: 'Publish Documentation'
+
+  ##############################################
+  # CODE QUALITY STAGE
+  ##############################################
+  - stage: CodeQuality
+    displayName: 'Code Quality'
+    dependsOn: 
+      - Validate
+      - Documentation
+    condition: succeeded('Validate')
+    jobs:
+      - job: SonarQube
+        displayName: 'SonarQube Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SonarQubePrepare@5
+            inputs:
+              SonarQube: 'SonarQube'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: '${{ parameters.sonarQubeProjectKey }}'
+              cliProjectName: '${{ parameters.sonarQubeProjectKey }}'
+              cliSources: '.'
+              extraProperties: |
+                sonar.exclusions=**/*.md,**/*.png,**/*.jpg
+                sonar.terraform.file.suffixes=.tf
+                sonar.terraform.activate=true
+            displayName: 'Prepare SonarQube Analysis'
+
+          - task: SonarQubeAnalyze@5
+            displayName: 'Run SonarQube Analysis'
+
+          - task: SonarQubePublish@5
+            inputs:
+              pollingTimeoutSec: '300'
+            displayName: 'Publish SonarQube Results'
+
+      - job: Snyk
+        displayName: 'Snyk Security Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SnykSecurityScan@1
+            inputs:
+              serviceConnectionEndpoint: 'Snyk'
+              testType: 'app'
+              monitorWhen: 'always'
+              failOnIssues: false
+              projectName: '$(Build.Repository.Name)'
+              organization: '$(SNYK_ORGANIZATION)'
+            displayName: 'Run Snyk Security Scan'
+
+  ##############################################
+  # PLAN STAGE
+  ##############################################
+  - stage: Plan
+    displayName: 'Plan'
+    dependsOn: CodeQuality
+    condition: succeeded('CodeQuality')
+    jobs:
+      - ${{ if parameters.enableParallelJobs }}:
+        - ${{ each environment in parameters.environments }}:
+          - job: Plan_${{ environment.name }}
+            displayName: 'Plan - ${{ environment.name }}'
+            pool:
+              vmImage: 'ubuntu-latest'
+            variables:
+              ENV_NAME: '${{ environment.name }}'
+            steps:
+              - template: ./terraform-plan-steps.yml
+                parameters:
+                  environment: '${{ environment.name }}'
+                  workingDirectory: '$(System.DefaultWorkingDirectory)'
+                  backendServiceArm: 'AWS-${{ environment.name }}'
+                  backendAWSBucketName: '$(TERRAFORM_STATE_BUCKET)'
+                  backendAWSKey: '$(TERRAFORM_STATE_KEY)/${{ environment.name }}'
+                  environmentServiceNameAWS: 'AWS-${{ environment.name }}'
+      - ${{ if not(parameters.enableParallelJobs) }}:
+        - ${{ each environment in parameters.environments }}:
+          - job: Plan_${{ environment.name }}
+            displayName: 'Plan - ${{ environment.name }}'
+            dependsOn: ${{ if ne(environment.name, first(parameters.environments).name) }}:
+              - ${{ format('Plan_{0}', prev(parameters.environments, environment).name) }}
+            ${{ if eq(environment.name, first(parameters.environments).name) }}:
+              dependsOn: []
+            pool:
+              vmImage: 'ubuntu-latest'
+            variables:
+              ENV_NAME: '${{ environment.name }}'
+            steps:
+              - template: ./terraform-plan-steps.yml
+                parameters:
+                  environment: '${{ environment.name }}'
+                  workingDirectory: '$(System.DefaultWorkingDirectory)'
+                  backendServiceArm: 'AWS-${{ environment.name }}'
+                  backendAWSBucketName: '$(TERRAFORM_STATE_BUCKET)'
+                  backendAWSKey: '$(TERRAFORM_STATE_KEY)/${{ environment.name }}'
+                  environmentServiceNameAWS: 'AWS-${{ environment.name }}'
+
+  ##############################################
+  # DEPLOY STAGES (One per environment)
+  ##############################################
+  - ${{ each environment in parameters.environments }}:
+    - stage: Deploy_${{ environment.name }}
+      displayName: 'Deploy to ${{ environment.name }}'
+      dependsOn: Plan
+      condition: succeeded('Plan')
+      jobs:
+        - deployment: Deploy
+          displayName: 'Deploy Infrastructure'
+          environment: ${{ environment.name }}
+          pool:
+            vmImage: 'ubuntu-latest'
+          ${{ if environment.requireApproval }}:
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - template: ./terraform-apply-steps.yml
+                      parameters:
+                        environment: '${{ environment.name }}'
+                        workingDirectory: '$(System.DefaultWorkingDirectory)'
+                        backendServiceArm: 'AWS-${{ environment.name }}'
+                        backendAWSBucketName: '$(TERRAFORM_STATE_BUCKET)'
+                        backendAWSKey: '$(TERRAFORM_STATE_KEY)/${{ environment.name }}'
+                        environmentServiceNameAWS: 'AWS-${{ environment.name }}'
+                        autoApply: ${{ environment.autoApply }}
+                        blueGreenDeployment: ${{ eq(environment.name, 'prod') }}
+          ${{ if not(environment.requireApproval) }}:
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - template: ./terraform-apply-steps.yml
+                      parameters:
+                        environment: '${{ environment.name }}'
+                        workingDirectory: '$(System.DefaultWorkingDirectory)'
+                        backendServiceArm: 'AWS-${{ environment.name }}'
+                        backendAWSBucketName: '$(TERRAFORM_STATE_BUCKET)'
+                        backendAWSKey: '$(TERRAFORM_STATE_KEY)/${{ environment.name }}'
+                        environmentServiceNameAWS: 'AWS-${{ environment.name }}'
+                        autoApply: ${{ environment.autoApply }}
+                        blueGreenDeployment: false
+
+        - job: Notify
+          displayName: 'Send Notifications'
+          dependsOn: Deploy
+          condition: always()
+          pool:
+            vmImage: 'ubuntu-latest'
+          steps:
+            - task: Bash@3
+              inputs:
+                targetType: 'inline'
+                script: |
+                  DEPLOYMENT_STATUS="$(Agent.JobStatus)"
+                  ENVIRONMENT="${{ environment.name }}"
+                  
+                  # Prepare the Slack message
+                  if [ "$DEPLOYMENT_STATUS" == "Succeeded" ]; then
+                    COLOR="good"
+                    STATUS="✅ Succeeded"
+                  else
+                    COLOR="danger"
+                    STATUS="❌ Failed"
+                  fi
+                  
+                  # Send notification to Slack
+                  curl -X POST -H 'Content-type: application/json' --data '{
+                    "channel": "$(SLACK_CHANNEL)",
+                    "attachments": [
+                      {
+                        "color": "'"$COLOR"'",
+                        "blocks": [
+                          {
+                            "type": "section",
+                            "text": {
+                              "type": "mrkdwn",
+                              "text": "*Terraform Deployment Status: '"$STATUS"'*\n*Environment:* '"$ENVIRONMENT"'\n*Pipeline:* <$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|$(Build.BuildNumber)>\n*Repository:* $(Build.Repository.Name)\n*Branch:* $(Build.SourceBranchName)"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }' $(SLACK_WEBHOOK_URL)
+              displayName: 'Send Slack Notification'
+              env:
+                SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)
+                SLACK_CHANNEL: ${{ parameters.slackChannel }}
